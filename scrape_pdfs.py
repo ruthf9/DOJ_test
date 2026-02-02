@@ -7,6 +7,8 @@ then extracts and downloads all PDF links.
 
 import os
 import re
+import sys
+import shutil
 import time
 import argparse
 import logging
@@ -49,6 +51,42 @@ def get_session() -> requests.Session:
     return session
 
 
+def _find_chrome_binary() -> str | None:
+    """Try to locate a Chrome/Chromium binary on the system."""
+    candidates = [
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    ]
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+    # Common Colab/Linux paths
+    for path in [
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/lib/chromium-browser/chromium-browser",
+    ]:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _find_chromedriver() -> str | None:
+    """Try to locate chromedriver on the system."""
+    path = shutil.which("chromedriver")
+    if path:
+        return path
+    for path in [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+        "/usr/local/bin/chromedriver",
+    ]:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
     """Use Selenium to load the page, select 'Show N' entries, and return HTML."""
     log.info("Starting headless Chrome browser...")
@@ -58,15 +96,32 @@ def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
+    # Auto-detect Chrome/Chromium binary (important for Colab)
+    chrome_bin = _find_chrome_binary()
+    if chrome_bin:
+        log.info("Using Chrome binary: %s", chrome_bin)
+        chrome_options.binary_location = chrome_bin
+
+    # Auto-detect chromedriver
+    chromedriver_path = _find_chromedriver()
+    service = None
+    if chromedriver_path:
+        log.info("Using chromedriver: %s", chromedriver_path)
+        service = Service(executable_path=chromedriver_path)
+
     driver = None
     try:
-        driver = webdriver.Chrome(options=chrome_options)
+        if service:
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        else:
+            driver = webdriver.Chrome(options=chrome_options)
         driver.set_page_load_timeout(60)
 
         log.info("Loading page: %s", url)
@@ -133,6 +188,13 @@ def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
 
     except Exception as e:
         log.error("Selenium error: %s", e)
+        log.error(
+            "Troubleshooting tips:\n"
+            "  - Google Colab: run this cell first:\n"
+            "      !apt-get update && apt-get install -y chromium-browser chromium-chromedriver\n"
+            "  - Local machine: install Chrome/Chromium and matching chromedriver\n"
+            "  - Check 'chromedriver --version' matches your Chrome version"
+        )
         return None
     finally:
         if driver:
