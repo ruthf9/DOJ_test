@@ -7,7 +7,8 @@ verifies that 209 entries are present, then downloads all PDF links.
 
 import os
 import re
-import sys
+import shutil
+import subprocess
 import time
 import argparse
 import logging
@@ -21,13 +22,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.core.os_manager import ChromeType
-    HAS_WEBDRIVER_MANAGER = True
-except ImportError:
-    HAS_WEBDRIVER_MANAGER = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,16 +55,48 @@ def get_session() -> requests.Session:
     return session
 
 
-def _create_chrome_driver() -> webdriver.Chrome:
-    """Create a headless Chrome driver, trying multiple strategies.
+def _ensure_chrome_installed() -> None:
+    """Install Google Chrome Stable if no suitable browser is found.
 
-    Order of attempts:
-      1. System-installed chromedriver + chromium-browser (best for Colab/CI)
-      2. Selenium built-in driver manager (Selenium 4.6+)
-      3. webdriver-manager package
+    Colab ships with an old Chromium (v114) whose chromedriver crashes.
+    Installing google-chrome-stable gives us a modern browser, and
+    Selenium 4.6+ auto-downloads the matching chromedriver.
     """
+    if shutil.which("google-chrome") or shutil.which("google-chrome-stable"):
+        return  # Already installed
+
+    log.info("google-chrome not found. Attempting auto-install...")
+    try:
+        subprocess.run(
+            "wget -q -O /tmp/chrome.deb "
+            "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb "
+            "&& apt-get install -y -qq /tmp/chrome.deb 2>/dev/null "
+            "&& rm /tmp/chrome.deb",
+            shell=True, check=True, capture_output=True,
+        )
+        log.info("Google Chrome Stable installed successfully.")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        log.warning(
+            "Auto-install failed. Please install Chrome manually:\n"
+            "  Google Colab:\n"
+            "    !wget -q -O /tmp/chrome.deb "
+            "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb\n"
+            "    !apt-get install -y /tmp/chrome.deb\n"
+            "  macOS:  brew install --cask google-chrome\n"
+            "  Ubuntu: sudo apt install google-chrome-stable"
+        )
+
+
+def _create_chrome_driver() -> webdriver.Chrome:
+    """Create a headless Chrome driver.
+
+    Installs google-chrome-stable if needed, then lets Selenium 4.6+
+    auto-manage the matching chromedriver.
+    """
+    _ensure_chrome_installed()
+
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -78,67 +104,20 @@ def _create_chrome_driver() -> webdriver.Chrome:
     chrome_options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # Detect system-installed browser binary
-    import shutil
-    for browser_path in [
-        shutil.which("chromium-browser"),
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome",
-    ]:
-        if browser_path and os.path.isfile(browser_path):
-            log.info("Found browser binary: %s", browser_path)
-            chrome_options.binary_location = browser_path
+    # Prefer google-chrome (modern) over old system chromium
+    for binary in ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"]:
+        path = shutil.which(binary)
+        if path:
+            log.info("Using browser: %s", path)
+            chrome_options.binary_location = path
             break
 
-    driver = None
-
-    # Strategy 1: System-installed chromedriver (matches system Chromium version)
-    for chromedriver_path in [
-        shutil.which("chromedriver"),
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ]:
-        if chromedriver_path and os.path.isfile(chromedriver_path):
-            log.info("Trying system chromedriver: %s", chromedriver_path)
-            try:
-                service = Service(executable_path=chromedriver_path)
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-                break
-            except Exception as e:
-                log.debug("System chromedriver failed: %s", e)
-
-    # Strategy 2: Selenium built-in manager (4.6+)
-    if driver is None:
-        log.info("Trying Selenium built-in driver manager...")
-        try:
-            driver = webdriver.Chrome(options=chrome_options)
-        except Exception as e:
-            log.debug("Selenium built-in manager failed: %s", e)
-
-    # Strategy 3: webdriver-manager (last resort, may have version mismatch)
-    if driver is None and HAS_WEBDRIVER_MANAGER:
-        log.info("Trying webdriver-manager...")
-        for chrome_type in [ChromeType.CHROMIUM, None]:
-            try:
-                kwargs = {"chrome_type": chrome_type} if chrome_type else {}
-                service = Service(ChromeDriverManager(**kwargs).install())
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-                break
-            except Exception as e:
-                log.debug("webdriver-manager attempt failed: %s", e)
-
-    if driver is None:
-        raise RuntimeError(
-            "Could not start Chrome. Install Chrome/Chromium and chromedriver, "
-            "or run: pip install webdriver-manager"
-        )
-
+    # Selenium 4.6+ will auto-download matching chromedriver
+    log.info("Starting Chrome (Selenium auto-manages chromedriver)...")
+    driver = webdriver.Chrome(options=chrome_options)
     driver.set_page_load_timeout(60)
     return driver
 
