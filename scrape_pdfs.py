@@ -62,9 +62,15 @@ def get_session() -> requests.Session:
 
 
 def _create_chrome_driver() -> webdriver.Chrome:
-    """Create a headless Chrome driver, trying multiple strategies."""
+    """Create a headless Chrome driver, trying multiple strategies.
+
+    Order of attempts:
+      1. System-installed chromedriver + chromium-browser (best for Colab/CI)
+      2. Selenium built-in driver manager (Selenium 4.6+)
+      3. webdriver-manager package
+    """
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
@@ -75,10 +81,48 @@ def _create_chrome_driver() -> webdriver.Chrome:
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
+    # Detect system-installed browser binary
+    import shutil
+    for browser_path in [
+        shutil.which("chromium-browser"),
+        shutil.which("chromium"),
+        shutil.which("google-chrome"),
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome",
+    ]:
+        if browser_path and os.path.isfile(browser_path):
+            log.info("Found browser binary: %s", browser_path)
+            chrome_options.binary_location = browser_path
+            break
+
     driver = None
 
-    # Strategy 1: webdriver-manager
-    if HAS_WEBDRIVER_MANAGER:
+    # Strategy 1: System-installed chromedriver (matches system Chromium version)
+    for chromedriver_path in [
+        shutil.which("chromedriver"),
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]:
+        if chromedriver_path and os.path.isfile(chromedriver_path):
+            log.info("Trying system chromedriver: %s", chromedriver_path)
+            try:
+                service = Service(executable_path=chromedriver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                break
+            except Exception as e:
+                log.debug("System chromedriver failed: %s", e)
+
+    # Strategy 2: Selenium built-in manager (4.6+)
+    if driver is None:
+        log.info("Trying Selenium built-in driver manager...")
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+        except Exception as e:
+            log.debug("Selenium built-in manager failed: %s", e)
+
+    # Strategy 3: webdriver-manager (last resort, may have version mismatch)
+    if driver is None and HAS_WEBDRIVER_MANAGER:
         log.info("Trying webdriver-manager...")
         for chrome_type in [ChromeType.CHROMIUM, None]:
             try:
@@ -88,14 +132,6 @@ def _create_chrome_driver() -> webdriver.Chrome:
                 break
             except Exception as e:
                 log.debug("webdriver-manager attempt failed: %s", e)
-
-    # Strategy 2: Selenium built-in manager (4.6+)
-    if driver is None:
-        log.info("Trying Selenium built-in driver manager...")
-        try:
-            driver = webdriver.Chrome(options=chrome_options)
-        except Exception as e:
-            log.debug("Selenium built-in manager failed: %s", e)
 
     if driver is None:
         raise RuntimeError(
