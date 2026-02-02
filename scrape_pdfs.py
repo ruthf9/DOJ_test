@@ -1,8 +1,8 @@
 """
 Scraper for PDF documents from mdlcentrality.com/SocialMedia/IndexMDL
 
-Downloads all linked PDF files from the page into a local directory.
-Handles pagination, retries, and rate-limiting.
+Uses Selenium to load the page, click "Show 300" to display all entries,
+then extracts and downloads all PDF links.
 """
 
 import os
@@ -14,6 +14,12 @@ from urllib.parse import urljoin, urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,20 +49,95 @@ def get_session() -> requests.Session:
     return session
 
 
-def fetch_page(session: requests.Session, url: str, retries: int = 3) -> str | None:
-    """Fetch a page with retries and exponential backoff."""
-    for attempt in range(retries):
+def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
+    """Use Selenium to load the page, select 'Show N' entries, and return HTML."""
+    log.info("Starting headless Chrome browser...")
+
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(60)
+
+        log.info("Loading page: %s", url)
+        driver.get(url)
+
+        # Wait for the page table to load
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "table"))
+        )
+        log.info("Page loaded successfully.")
+
+        # Try to find and change the "Show entries" dropdown
         try:
-            resp = session.get(url, timeout=30)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as e:
-            wait = 2 ** (attempt + 1)
-            log.warning("Failed to fetch %s (attempt %d/%d): %s – retrying in %ds",
-                        url, attempt + 1, retries, e, wait)
-            time.sleep(wait)
-    log.error("Could not fetch %s after %d attempts", url, retries)
-    return None
+            # DataTables typically uses a <select> with name ending in '_length'
+            select_el = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    "select[name$='_length'], .dataTables_length select"
+                ))
+            )
+            select = Select(select_el)
+
+            # Try to select the desired value (e.g. 300, 200, 100, -1 for "All")
+            selected = False
+            for value in [str(show_entries), "-1", "All"]:
+                try:
+                    select.select_by_value(value)
+                    selected = True
+                    log.info("Selected 'Show %s' from dropdown.", value)
+                    break
+                except Exception:
+                    continue
+
+            if not selected:
+                # Try selecting by visible text
+                for text in [str(show_entries), "All", "300", "200", "100"]:
+                    try:
+                        select.select_by_visible_text(text)
+                        selected = True
+                        log.info("Selected 'Show %s' by visible text.", text)
+                        break
+                    except Exception:
+                        continue
+
+            if selected:
+                # Wait for table to reload with new entries
+                time.sleep(3)
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
+                )
+                log.info("Table reloaded with more entries.")
+            else:
+                log.warning("Could not change 'Show entries' dropdown. Using default view.")
+
+        except Exception as e:
+            log.warning("Could not find 'Show entries' dropdown: %s", e)
+
+        # Give extra time for all rows to render
+        time.sleep(2)
+
+        html = driver.page_source
+        log.info("Captured page source (%d characters).", len(html))
+        return html
+
+    except Exception as e:
+        log.error("Selenium error: %s", e)
+        return None
+    finally:
+        if driver:
+            driver.quit()
+            log.info("Browser closed.")
 
 
 def extract_pdf_links(html: str, base_url: str) -> list[dict]:
@@ -96,23 +177,6 @@ def extract_pdf_links(html: str, base_url: str) -> list[dict]:
         })
 
     return pdf_links
-
-
-def find_next_page(html: str, base_url: str) -> str | None:
-    """Look for a 'next page' link for paginated listings."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Common patterns for pagination links
-    for a_tag in soup.find_all("a", href=True):
-        text = a_tag.get_text(strip=True).lower()
-        classes = " ".join(a_tag.get("class", [])).lower()
-
-        if any(kw in text for kw in ("next", "nächste", "»", "›")):
-            return urljoin(base_url, a_tag["href"])
-        if "next" in classes:
-            return urljoin(base_url, a_tag["href"])
-
-    return None
 
 
 def download_pdf(
@@ -162,8 +226,7 @@ def scrape_pdfs(
     output_dir: str = DEFAULT_OUTPUT_DIR,
     delay: float = 1.0,
     skip_existing: bool = True,
-    follow_pagination: bool = True,
-    max_pages: int = 50,
+    show_entries: int = 300,
 ) -> list[str]:
     """Main scraping function.
 
@@ -172,44 +235,30 @@ def scrape_pdfs(
         output_dir: Directory to save downloaded PDFs.
         delay: Seconds to wait between downloads (be polite).
         skip_existing: Skip files that already exist locally.
-        follow_pagination: Follow 'next page' links if present.
-        max_pages: Maximum number of pages to follow.
+        show_entries: Number of entries to show (clicks 'Show N' dropdown).
 
     Returns:
         List of paths to successfully downloaded files.
     """
     os.makedirs(output_dir, exist_ok=True)
-    session = get_session()
 
-    all_pdf_links = []
-    current_url = start_url
-    page_num = 0
+    # Step 1: Use Selenium to load page and click "Show 300"
+    html = fetch_page_with_selenium(start_url, show_entries=show_entries)
+    if html is None:
+        log.error("Failed to load page with Selenium.")
+        return []
 
-    # Collect PDF links from all pages
-    while current_url and page_num < max_pages:
-        page_num += 1
-        log.info("Fetching page %d: %s", page_num, current_url)
-
-        html = fetch_page(session, current_url)
-        if html is None:
-            break
-
-        pdf_links = extract_pdf_links(html, current_url)
-        log.info("Found %d PDF link(s) on page %d", len(pdf_links), page_num)
-        all_pdf_links.extend(pdf_links)
-
-        if follow_pagination:
-            current_url = find_next_page(html, current_url)
-        else:
-            break
+    # Step 2: Extract PDF links from the fully rendered page
+    all_pdf_links = extract_pdf_links(html, start_url)
 
     if not all_pdf_links:
-        log.warning("No PDF links found on the page(s).")
+        log.warning("No PDF links found on the page.")
         return []
 
     log.info("Total PDF links found: %d", len(all_pdf_links))
 
-    # Download all PDFs
+    # Step 3: Download all PDFs using requests (faster than Selenium)
+    session = get_session()
     downloaded = []
     for i, link in enumerate(all_pdf_links, 1):
         filename = sanitize_filename(link["filename"])
@@ -256,20 +305,15 @@ def main():
         help="Delay in seconds between downloads (default: 1.0)",
     )
     parser.add_argument(
+        "--show-entries",
+        type=int,
+        default=300,
+        help="Number of entries to show on the page (default: 300)",
+    )
+    parser.add_argument(
         "--no-skip",
         action="store_true",
         help="Re-download files even if they already exist",
-    )
-    parser.add_argument(
-        "--no-pagination",
-        action="store_true",
-        help="Don't follow pagination links",
-    )
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=50,
-        help="Maximum number of pages to follow (default: 50)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -287,8 +331,7 @@ def main():
         output_dir=args.output_dir,
         delay=args.delay,
         skip_existing=not args.no_skip,
-        follow_pagination=not args.no_pagination,
-        max_pages=args.max_pages,
+        show_entries=args.show_entries,
     )
 
 
