@@ -23,6 +23,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
+    HAS_WEBDRIVER_MANAGER = True
+except ImportError:
+    HAS_WEBDRIVER_MANAGER = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -109,19 +116,40 @@ def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
         log.info("Using Chrome binary: %s", chrome_bin)
         chrome_options.binary_location = chrome_bin
 
-    # Auto-detect chromedriver
-    chromedriver_path = _find_chromedriver()
-    service = None
-    if chromedriver_path:
-        log.info("Using chromedriver: %s", chromedriver_path)
-        service = Service(executable_path=chromedriver_path)
-
     driver = None
     try:
-        if service:
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-        else:
-            driver = webdriver.Chrome(options=chrome_options)
+        # Strategy 1: Use webdriver-manager (most reliable, handles version matching)
+        if HAS_WEBDRIVER_MANAGER:
+            log.info("Using webdriver-manager to find/install chromedriver...")
+            try:
+                service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+            except Exception as e1:
+                log.debug("webdriver-manager with Chromium failed: %s", e1)
+                try:
+                    service = Service(ChromeDriverManager().install())
+                    driver = webdriver.Chrome(service=service, options=chrome_options)
+                except Exception as e2:
+                    log.debug("webdriver-manager with Chrome failed: %s", e2)
+
+        # Strategy 2: Let Selenium's built-in manager handle it (Selenium 4.6+)
+        if driver is None:
+            log.info("Trying Selenium's built-in driver manager...")
+            try:
+                driver = webdriver.Chrome(options=chrome_options)
+            except Exception as e3:
+                log.debug("Selenium built-in manager failed: %s", e3)
+
+        # Strategy 3: Try manually detected chromedriver as last resort
+        if driver is None:
+            chromedriver_path = _find_chromedriver()
+            if chromedriver_path:
+                log.info("Trying system chromedriver: %s", chromedriver_path)
+                service = Service(executable_path=chromedriver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        if driver is None:
+            raise RuntimeError("Could not start Chrome with any strategy")
         driver.set_page_load_timeout(60)
 
         log.info("Loading page: %s", url)
