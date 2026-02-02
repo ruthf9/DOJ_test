@@ -1,14 +1,13 @@
 """
 Scraper for PDF documents from mdlcentrality.com/SocialMedia/IndexMDL
 
-Uses Selenium to load the page, click "Show 300" to display all entries,
-then extracts and downloads all PDF links.
+Uses Selenium to load the page, select "Show 300" from the ASP.NET dropdown,
+verifies that 209 entries are present, then downloads all PDF links.
 """
 
 import os
 import re
 import sys
-import shutil
 import time
 import argparse
 import logging
@@ -38,6 +37,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_URL = "https://www.mdlcentrality.com/SocialMedia/IndexMDL"
 DEFAULT_OUTPUT_DIR = "downloaded_pdfs"
+EXPECTED_ENTRIES = 209
 
 HEADERS = {
     "User-Agent": (
@@ -50,6 +50,9 @@ HEADERS = {
     "Referer": "https://www.mdlcentrality.com/",
 }
 
+# ASP.NET dropdown element ID for "Show N" selector
+DROPDOWN_ID = "ContentPlaceHolder1_ddlPageSize"
+
 
 def get_session() -> requests.Session:
     """Create a requests session with browser-like headers."""
@@ -58,46 +61,8 @@ def get_session() -> requests.Session:
     return session
 
 
-def _find_chrome_binary() -> str | None:
-    """Try to locate a Chrome/Chromium binary on the system."""
-    candidates = [
-        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
-    ]
-    for name in candidates:
-        path = shutil.which(name)
-        if path:
-            return path
-    # Common Colab/Linux paths
-    for path in [
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/lib/chromium-browser/chromium-browser",
-    ]:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def _find_chromedriver() -> str | None:
-    """Try to locate chromedriver on the system."""
-    path = shutil.which("chromedriver")
-    if path:
-        return path
-    for path in [
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-        "/usr/local/bin/chromedriver",
-    ]:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
-    """Use Selenium to load the page, select 'Show N' entries, and return HTML."""
-    log.info("Starting headless Chrome browser...")
-
+def _create_chrome_driver() -> webdriver.Chrome:
+    """Create a headless Chrome driver, trying multiple strategies."""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -110,124 +75,89 @@ def fetch_page_with_selenium(url: str, show_entries: int = 300) -> str | None:
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # Auto-detect Chrome/Chromium binary (important for Colab)
-    chrome_bin = _find_chrome_binary()
-    if chrome_bin:
-        log.info("Using Chrome binary: %s", chrome_bin)
-        chrome_options.binary_location = chrome_bin
-
     driver = None
+
+    # Strategy 1: webdriver-manager
+    if HAS_WEBDRIVER_MANAGER:
+        log.info("Trying webdriver-manager...")
+        for chrome_type in [ChromeType.CHROMIUM, None]:
+            try:
+                kwargs = {"chrome_type": chrome_type} if chrome_type else {}
+                service = Service(ChromeDriverManager(**kwargs).install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                break
+            except Exception as e:
+                log.debug("webdriver-manager attempt failed: %s", e)
+
+    # Strategy 2: Selenium built-in manager (4.6+)
+    if driver is None:
+        log.info("Trying Selenium built-in driver manager...")
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+        except Exception as e:
+            log.debug("Selenium built-in manager failed: %s", e)
+
+    if driver is None:
+        raise RuntimeError(
+            "Could not start Chrome. Install Chrome/Chromium and chromedriver, "
+            "or run: pip install webdriver-manager"
+        )
+
+    driver.set_page_load_timeout(60)
+    return driver
+
+
+def fetch_page_with_all_entries(url: str) -> str:
+    """Load the page, select 'Show 300' from the ASP.NET dropdown, return HTML."""
+    driver = _create_chrome_driver()
     try:
-        # Strategy 1: Use webdriver-manager (most reliable, handles version matching)
-        if HAS_WEBDRIVER_MANAGER:
-            log.info("Using webdriver-manager to find/install chromedriver...")
-            try:
-                service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-            except Exception as e1:
-                log.debug("webdriver-manager with Chromium failed: %s", e1)
-                try:
-                    service = Service(ChromeDriverManager().install())
-                    driver = webdriver.Chrome(service=service, options=chrome_options)
-                except Exception as e2:
-                    log.debug("webdriver-manager with Chrome failed: %s", e2)
-
-        # Strategy 2: Let Selenium's built-in manager handle it (Selenium 4.6+)
-        if driver is None:
-            log.info("Trying Selenium's built-in driver manager...")
-            try:
-                driver = webdriver.Chrome(options=chrome_options)
-            except Exception as e3:
-                log.debug("Selenium built-in manager failed: %s", e3)
-
-        # Strategy 3: Try manually detected chromedriver as last resort
-        if driver is None:
-            chromedriver_path = _find_chromedriver()
-            if chromedriver_path:
-                log.info("Trying system chromedriver: %s", chromedriver_path)
-                service = Service(executable_path=chromedriver_path)
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-
-        if driver is None:
-            raise RuntimeError("Could not start Chrome with any strategy")
-        driver.set_page_load_timeout(60)
-
         log.info("Loading page: %s", url)
         driver.get(url)
 
-        # Wait for the page table to load
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, "table"))
+        # Wait for the dropdown to be present
+        dropdown_el = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, DROPDOWN_ID))
         )
-        log.info("Page loaded successfully.")
+        log.info("Page loaded. Found dropdown #%s.", DROPDOWN_ID)
 
-        # Try to find and change the "Show entries" dropdown
-        try:
-            # DataTables typically uses a <select> with name ending in '_length'
-            select_el = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((
-                    By.CSS_SELECTOR,
-                    "select[name$='_length'], .dataTables_length select"
-                ))
+        # Select "300" to show all entries
+        select = Select(dropdown_el)
+        current_value = select.first_selected_option.get_attribute("value")
+        log.info("Current dropdown value: %s", current_value)
+
+        if current_value != "300":
+            log.info("Selecting '300' from dropdown...")
+            select.select_by_value("300")
+
+            # The ASP.NET __doPostBack will cause a page reload.
+            # Wait for the page to become stale, then wait for the new table.
+            WebDriverWait(driver, 30).until(EC.staleness_of(dropdown_el))
+            log.info("Page is reloading after postback...")
+
+            # Wait for the new page to fully load
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.ID, DROPDOWN_ID))
             )
-            select = Select(select_el)
+            # Verify the new dropdown has 300 selected
+            new_dropdown = driver.find_element(By.ID, DROPDOWN_ID)
+            new_select = Select(new_dropdown)
+            log.info(
+                "Dropdown now shows: %s",
+                new_select.first_selected_option.get_attribute("value"),
+            )
+        else:
+            log.info("Dropdown already set to 300.")
 
-            # Try to select the desired value (e.g. 300, 200, 100, -1 for "All")
-            selected = False
-            for value in [str(show_entries), "-1", "All"]:
-                try:
-                    select.select_by_value(value)
-                    selected = True
-                    log.info("Selected 'Show %s' from dropdown.", value)
-                    break
-                except Exception:
-                    continue
-
-            if not selected:
-                # Try selecting by visible text
-                for text in [str(show_entries), "All", "300", "200", "100"]:
-                    try:
-                        select.select_by_visible_text(text)
-                        selected = True
-                        log.info("Selected 'Show %s' by visible text.", text)
-                        break
-                    except Exception:
-                        continue
-
-            if selected:
-                # Wait for table to reload with new entries
-                time.sleep(3)
-                WebDriverWait(driver, 30).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
-                )
-                log.info("Table reloaded with more entries.")
-            else:
-                log.warning("Could not change 'Show entries' dropdown. Using default view.")
-
-        except Exception as e:
-            log.warning("Could not find 'Show entries' dropdown: %s", e)
-
-        # Give extra time for all rows to render
+        # Give the table time to fully render
         time.sleep(2)
 
         html = driver.page_source
         log.info("Captured page source (%d characters).", len(html))
         return html
 
-    except Exception as e:
-        log.error("Selenium error: %s", e)
-        log.error(
-            "Troubleshooting tips:\n"
-            "  - Google Colab: run this cell first:\n"
-            "      !apt-get update && apt-get install -y chromium-browser chromium-chromedriver\n"
-            "  - Local machine: install Chrome/Chromium and matching chromedriver\n"
-            "  - Check 'chromedriver --version' matches your Chrome version"
-        )
-        return None
     finally:
-        if driver:
-            driver.quit()
-            log.info("Browser closed.")
+        driver.quit()
+        log.info("Browser closed.")
 
 
 def extract_pdf_links(html: str, base_url: str) -> list[dict]:
@@ -242,7 +172,6 @@ def extract_pdf_links(html: str, base_url: str) -> list[dict]:
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"].strip()
 
-        # Match links ending in .pdf or containing .pdf before query params
         if not re.search(r"\.pdf(\?.*)?$", href, re.IGNORECASE):
             continue
 
@@ -252,7 +181,6 @@ def extract_pdf_links(html: str, base_url: str) -> list[dict]:
             continue
         seen_urls.add(full_url)
 
-        # Derive a filename from the URL
         path = urlparse(full_url).path
         filename = unquote(os.path.basename(path))
         if not filename.lower().endswith(".pdf"):
@@ -296,8 +224,10 @@ def download_pdf(
 
         except requests.RequestException as e:
             wait = 2 ** (attempt + 1)
-            log.warning("Download failed for %s (attempt %d/%d): %s – retrying in %ds",
-                        url, attempt + 1, retries, e, wait)
+            log.warning(
+                "Download failed for %s (attempt %d/%d): %s – retrying in %ds",
+                url, attempt + 1, retries, e, wait,
+            )
             time.sleep(wait)
 
     log.error("Could not download %s after %d attempts", url, retries)
@@ -316,41 +246,49 @@ def scrape_pdfs(
     output_dir: str = DEFAULT_OUTPUT_DIR,
     delay: float = 1.0,
     skip_existing: bool = True,
-    show_entries: int = 300,
+    expected_entries: int = EXPECTED_ENTRIES,
 ) -> list[str]:
     """Main scraping function.
 
-    Args:
-        start_url: The URL to scrape PDF links from.
-        output_dir: Directory to save downloaded PDFs.
-        delay: Seconds to wait between downloads (be polite).
-        skip_existing: Skip files that already exist locally.
-        show_entries: Number of entries to show (clicks 'Show N' dropdown).
+    1. Load page and select "Show 300"
+    2. Verify that exactly `expected_entries` PDF links are found
+    3. Download all PDFs
 
-    Returns:
-        List of paths to successfully downloaded files.
+    Returns list of paths to successfully downloaded files.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Step 1: Use Selenium to load page and click "Show 300"
-    html = fetch_page_with_selenium(start_url, show_entries=show_entries)
-    if html is None:
-        log.error("Failed to load page with Selenium.")
+    # Step 1: Load page with Selenium and select "Show 300"
+    html = fetch_page_with_all_entries(start_url)
+
+    # Step 2: Extract PDF links
+    pdf_links = extract_pdf_links(html, start_url)
+
+    if not pdf_links:
+        log.error("No PDF links found on the page. Aborting.")
         return []
 
-    # Step 2: Extract PDF links from the fully rendered page
-    all_pdf_links = extract_pdf_links(html, start_url)
+    log.info("Found %d PDF links.", len(pdf_links))
 
-    if not all_pdf_links:
-        log.warning("No PDF links found on the page.")
+    # Step 3: Verify expected count
+    if len(pdf_links) != expected_entries:
+        log.error(
+            "Expected %d entries but found %d. "
+            "The page content may have changed. Aborting download.",
+            expected_entries,
+            len(pdf_links),
+        )
+        log.info("Found links:")
+        for i, link in enumerate(pdf_links, 1):
+            log.info("  %d. %s -> %s", i, link["text"], link["url"])
         return []
 
-    log.info("Total PDF links found: %d", len(all_pdf_links))
+    log.info("Entry count matches expected %d. Starting downloads.", expected_entries)
 
-    # Step 3: Download all PDFs using requests (faster than Selenium)
+    # Step 4: Download all PDFs
     session = get_session()
     downloaded = []
-    for i, link in enumerate(all_pdf_links, 1):
+    for i, link in enumerate(pdf_links, 1):
         filename = sanitize_filename(link["filename"])
         dest_path = os.path.join(output_dir, filename)
 
@@ -360,23 +298,26 @@ def scrape_pdfs(
             filename = f"{base}_{i}{ext}"
             dest_path = os.path.join(output_dir, filename)
 
-        log.info("[%d/%d] Downloading: %s", i, len(all_pdf_links), link["text"])
-        success = download_pdf(session, link["url"], dest_path,
-                               skip_existing=skip_existing)
+        log.info("[%d/%d] %s", i, len(pdf_links), link["text"])
+        success = download_pdf(
+            session, link["url"], dest_path, skip_existing=skip_existing,
+        )
         if success:
             downloaded.append(dest_path)
 
-        if delay > 0 and i < len(all_pdf_links):
+        if delay > 0 and i < len(pdf_links):
             time.sleep(delay)
 
-    log.info("Done. Downloaded %d/%d files to '%s'",
-             len(downloaded), len(all_pdf_links), output_dir)
+    log.info(
+        "Done. Downloaded %d/%d files to '%s'.",
+        len(downloaded), len(pdf_links), output_dir,
+    )
     return downloaded
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape PDF documents from mdlcentrality.com"
+        description="Scrape PDF documents from mdlcentrality.com/SocialMedia/IndexMDL"
     )
     parser.add_argument(
         "-u", "--url",
@@ -392,13 +333,13 @@ def main():
         "-d", "--delay",
         type=float,
         default=1.0,
-        help="Delay in seconds between downloads (default: 1.0)",
+        help="Delay between downloads in seconds (default: 1.0)",
     )
     parser.add_argument(
-        "--show-entries",
+        "--expected-entries",
         type=int,
-        default=300,
-        help="Number of entries to show on the page (default: 300)",
+        default=EXPECTED_ENTRIES,
+        help="Expected number of PDF entries (default: %(default)s)",
     )
     parser.add_argument(
         "--no-skip",
@@ -421,7 +362,7 @@ def main():
         output_dir=args.output_dir,
         delay=args.delay,
         skip_existing=not args.no_skip,
-        show_entries=args.show_entries,
+        expected_entries=args.expected_entries,
     )
 
 
